@@ -107,6 +107,17 @@ torch::Tensor
         return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, preshuffleB, k_batch);
 """
 
+        if k.M_Warp * k.N_Warp * k.K_Warp == 8:
+            # 8-warp CompV3 on wave32 (gfx12) needs -DCK_TILE_USE_WMMA=1 on host and
+            # device, which a build that also targets gfx9 can't set: skip the gfx12
+            # device code (the kernel then has no gfx12 image).
+            TILE_INSTANCE = f"""#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx12__)
+        return Y;
+#else
+{TILE_INSTANCE}
+#endif
+"""
+
         TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
             "__TILE_INSTANCE_PLACEHOLDER__", TILE_INSTANCE
         )
