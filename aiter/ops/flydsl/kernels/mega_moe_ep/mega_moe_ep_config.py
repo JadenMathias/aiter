@@ -23,7 +23,7 @@ import os
 import flydsl.expr as fx
 
 from ..kernels_common import ceildiv
-from ..mega_moe_tp.common import DEADLINE, MAX_TP
+from ..mega_moe_tp.common import MAX_TP
 from ..mega_moe_tp.mega_moe_tp_config import KernelCtx
 
 __all__ = [
@@ -38,7 +38,6 @@ __all__ = [
     "C_UL",
     "C_UROWS",
     "C_USEQ",
-    "DYN_MAX",
     "EPOCH_SLOT",
     "ERR_COMBINE",
     "ERR_COMPUTE",
@@ -86,16 +85,12 @@ NTT = NT
 # GEMM geometry (the compute waves reuse the mega_moe stage1/stage2 MFMA atoms; see
 # gemm.py). TILE_K is the MFMA K-step byte granularity; TILE_N the GEMM1 output column
 # tile over the gate|up halves (2*inter_dim). FP4 activations halve the per-K-step A bytes.
-KCS = 2  # A K-chunks staged together
 TILE_K = 256
 # Each of the 8 compute waves owns TILE_N / NW = 64 output cols, i.e. 32 per gate|up half
 # = exactly one 1x32 MX quant group (NUM_ACC_N=4, gui_n=2): the register GEMM1 epilogue +
 # the chunked GEMM2 cshuffle need the per-wave group to be in-wave.
 TILE_N = 512
 
-# Up to this many received (token, expert) pairs per rank use the dynamic planner
-# (the one ported here); larger batches want an LB-style two-phase planner (future).
-DYN_MAX = 256
 # The per-echunk tables (chunk lookup, ECNT counters, inter / inters / rowmap / rowidx)
 # are sized by nch_max() / inter_rows().
 
@@ -158,10 +153,15 @@ FLAG_PAYC = FLAG_DISPM_CNT + 2 * NCTA_MAX
 #   FLAG_SBP + src   src's payload rows to this rank landed (epoch)
 #   FLAG_SBD + own   owner rank ``own`` finished its whole tile queue (epoch): every
 #                    part row it scattered to this rank landed
-# The SBX tag is the epoch's low 32 - SBX_TB bits above SBX_TB value bits.  Routing
-# words start (and are re-scrubbed once per tag period, communication.sbx_scrub) as -1:
-# all-ones value bits never pass, so a word unwritten for a whole period can't match.
-SBX_TB = 9
+# The SBX tag is the epoch's low 32 - SBX_TB bits above SBX_TB value bits (m up to
+# 1022, so every SB engine's max_tok_per_rank fits).  Routing words start (and are
+# re-scrubbed once per tag period, communication.sbx_scrub) as -1: all-ones value bits
+# never pass, so a word unwritten for a whole period can't match.
+SBX_TB = 10
+# SB kernel at inter_dim <= SB_SHORT_I (a short GEMM2 K loop): the mt2 kernel keeps the
+# full GEMM2 n-tile, and the host streams the weights non-temporally only up to
+# mega_moe_ep.SB_WNT_MAX_SHORT_I tokens.
+SB_SHORT_I = 2048
 FLAG_SBM = FLAG_PAYC + 2 * NCTA_MAX
 FLAG_SBP = FLAG_SBM + MAX_NPES
 FLAG_SBD = FLAG_SBP + MAX_NPES
@@ -194,12 +194,17 @@ ECNT1 = 64
 # an XCD-local atomic counter -- all GEMM1 tiles, then all GEMM2 tiles (each waits its
 # echunk's N_TILES GEMM1 tiles; the echunk's last GEMM2 tile arrives the combine).  No
 # idle CTAs, no partial rounds, no grid barrier between the GEMMs.  An echunk's producers and consumers share the XCD's
-# L2, so drained stores + the counter suffice; a CTA whose hardware XCC is not
-# bid % N_XCD reports ERR_COMPUTE.  The queue runs expert-major (an expert's n-tiles,
+# L2, so drained stores + the counter suffice.  That needs every bid % N_XCD class on one
+# hardware XCC; a HW queue other than the default stream's rotates the bid -> XCC map by
+# a constant, which keeps it.  The queue runs expert-major (an expert's n-tiles,
 # its echunks minor, so the expert's A stays in L2 across its n-tiles).
 QCNT = 32  # [QCNT, QCNT + N_XCD): per-XCD tile-queue counters (self-resetting)
 QDONE = QCNT + N_XCD  # CTAs past the tile queue (the last one resets FLAG_PAYC)
 assert QDONE < ECNT1
+# OR of each CTA's bit (hardware XCC - bid) % N_XCD; the last CTA past the tile queue
+# reports ERR_COMPUTE if more than one offset is set, then zeroes it.
+XMAP = 28
+assert EPOCH_SLOT < XMAP < QCNT
 # Dispatch/GEMM overlap: the payload goes in LB = ceil(EPR / N_XCD) rounds -- round g:
 # the (token, owner) rows whose smallest le % LB over the token's local experts on that
 # owner is g, so expert le is complete after round le % LB, about one expert per owner
@@ -429,23 +434,19 @@ def kernel_config(
     """
     if act not in ACT_SET:
         raise ValueError(f"mega_moe_ep act must be one of {ACT_SET}, got {act!r}")
-    if swiglu_limit is None:
+    # A limit <= 0 means no SwiGLU clamp, as in the oracle and MegaMoEV2.
+    if swiglu_limit is None or swiglu_limit <= 0:
         swiglu_limit = float("inf")
     c = mega_moe_ep_consts(H, I, MT, EPR, TMAX, a8, SB)
     RG, LDS_BYTES, NBW = c["RG"], c["LDS_BYTES"], c["NBW"]
     L_A, L_AS = c["L_A"], c["L_AS"]
     L_DYN, L_DCNT, L_WSUM = c["L_DYN"], c["L_DCNT"], c["L_WSUM"]
-    L_DCH, L_EOFF, L_RIX, L_CTL = c["L_DCH"], c["L_EOFF"], c["L_RIX"], c["L_CTL"]
+    L_DCH, L_RIX, L_CTL = c["L_DCH"], c["L_RIX"], c["L_CTL"]
     L_DIX, NDIXW = c["L_DIX"], c["NDIXW"]
     L_C = c["L_C"]
-    KS1, KS2, G2 = c["KS1"], c["KS2"], c["G2"]
-    CH1, CH2, M_REPEAT = c["CH1"], c["CH2"], c["M_REPEAT"]
+    M_REPEAT = c["M_REPEAT"]
     N_TILES, NUM_ACC_N = c["N_TILES"], c["NUM_ACC_N"]
     A_K_STEP, K_ITERS, A_LDS_I32 = c["A_K_STEP"], c["K_ITERS"], c["A_LDS_I32"]
-    # GEMM1 inter-piece choices the planner balances over: fixed at P=1 (no inter
-    # split).  GEMM2 contracts the full inter dim, so one unit must own the whole inter
-    # dim; P>1 would feed GEMM2 an incomplete intermediate.
-    DYN_PS = [1]
     rch = RG  # dynamic row chunk = one row tile (16*mt)
     NCHM = nch_max(TMAX, TOPK, RG, EPR)
     ECNT2 = ECNT1 + NCHM
@@ -497,8 +498,8 @@ def kernel_config(
     HWBAR = bool(SB)
     # GEMM2 n-tile: no quant group ties it to the wave, and the tile queue ends on GEMM2
     # tiles, so the SB mt2 kernel halves it to shorten the queue's tail (the mt4 SB
-    # kernel keeps TILE_N).
-    TILE_N2 = 256 if SB and MT == 2 else TILE_N
+    # kernel and inter_dim <= SB_SHORT_I keep TILE_N).
+    TILE_N2 = 256 if SB and MT == 2 and I > SB_SHORT_I else TILE_N
     # SB tile queue: pull the next tile after the K-loop, before this tile's epilogue,
     # instead of after its drain.  The large kernel keeps the pull after the drain.
     QLA = bool(SB)
@@ -519,5 +520,4 @@ def kernel_config(
         + (f"_lim{swiglu_limit:g}" if math.isfinite(swiglu_limit) else "")
         + ("_sdma" if SDMAD else "")
     )
-    layout_tag = f"{ECNT2 + NCHM}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"
     return KernelCtx(**locals(), NW=NW, NT=NT, NTT=NTT, TILE_N=TILE_N)

@@ -22,6 +22,7 @@ from .mega_moe_ep_config import (
     MAX_NPES,
     N_XCD,
     NCTA_MAX,
+    SB_SHORT_I,
     SD_BASE,
     SD_DUM,
     SD_INTS,
@@ -47,12 +48,14 @@ MT8_MIN = 768
 # Small-batch kernel variant (LaunchCfg.small) for engines of max_tok_per_rank <= SB_MAX:
 # picked from mtpr, so every rank runs the same variant.  a8w4 row tile mt=2 up to
 # SB_MT2_MAX tokens; mt only shapes the rank-local echunks.
-SB_MAX = 256
+SB_MAX = 512
 SB_MT2_MAX = 159
 # a4w4 likewise up to SB_MT2_MAX_A4.
 SB_MT2_MAX_A4 = 159
-# SB kernel streams its weights (kernel_config WNT) from this many tokens.
+# SB kernel streams its weights (kernel_config WNT) from SB_WNT_MIN tokens; at
+# inter_dim <= SB_SHORT_I only up to SB_WNT_MAX_SHORT_I.
 SB_WNT_MIN = 2
+SB_WNT_MAX_SHORT_I = 416
 
 
 def _dequant_expert(weight, scale, rows, cols):
@@ -206,6 +209,8 @@ class MegaMoeEPEngine:
             raise ValueError(f"MegaMoeEP topk must be in [1, 16], got {topk}")
         if act not in ("silu", "situv2"):
             raise ValueError(f"MegaMoeEP act must be 'silu' or 'situv2', got {act!r}")
+        if not float(swiglu_limit) >= 0:
+            raise ValueError(f"swiglu_limit must be non-negative, got {swiglu_limit}")
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.H = int(model_dim)
@@ -214,6 +219,7 @@ class MegaMoeEPEngine:
         self.epr = int(experts // world_size)
         self.K = int(topk)
         self.mtpr = mtpr
+        self.wnt_max = SB_WNT_MAX_SHORT_I if self.I <= SB_SHORT_I else mtpr
         self.a8 = quant == "a8w4"
         self.act = act
         self.situ = (float(situ_beta), float(situ_linear_beta))
@@ -405,16 +411,17 @@ class MegaMoeEPEngine:
                 mt=self._fit_mt(m, small),
                 a8=self.a8,
                 small=small,
-                wnt=small and m >= SB_WNT_MIN,
+                wnt=small and SB_WNT_MIN <= m <= self.wnt_max,
             )
             self._cfgs[m] = cfg
         return cfg
 
     def _variants(self):
         """Every LaunchCfg a token count in [0, mtpr] selects (mt / wnt only change at the
-        SB_WNT_MIN / SB_MT2 / MT8_MIN bounds)."""
+        SB_WNT_MIN / wnt_max / SB_MT2 / MT8_MIN bounds)."""
         th = SB_MT2_MAX if self.a8 else SB_MT2_MAX_A4
-        ms = {0, 1, SB_WNT_MIN, th, th + 1, MT8_MIN - 1, MT8_MIN, self.mtpr}
+        wx = self.wnt_max
+        ms = {0, 1, SB_WNT_MIN, wx, wx + 1, th, th + 1, MT8_MIN - 1, MT8_MIN, self.mtpr}
         return sorted(
             {self.config(m) for m in ms if 0 <= m <= self.mtpr}, key=lambda c: c.mt
         )
@@ -545,28 +552,49 @@ class MegaMoeEPEngine:
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
+        # The kernel reads these by raw pointer.
+        if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
+            raise ValueError("x_bf16 must be contiguous bfloat16")
+        if wts.dtype != torch.float32 or not wts.is_contiguous():
+            raise ValueError("wts must be contiguous float32")
+        if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+            raise ValueError("topk_ids must be contiguous int32")
+        if tuple(x_bf16.shape) != (run_tokens, self.H) or any(
+            tuple(t.shape) != (run_tokens, self.K) for t in (wts, topk_ids)
+        ):
+            raise ValueError(
+                f"expected x_bf16 [{run_tokens}, {self.H}] and wts / topk_ids "
+                f"[{run_tokens}, {self.K}], got {tuple(x_bf16.shape)}, "
+                f"{tuple(wts.shape)}, {tuple(topk_ids.shape)}"
+            )
+        if any(t.device != self.device for t in (x_bf16, wts, topk_ids)):
+            raise ValueError(f"x_bf16, wts and topk_ids must be on {self.device}")
         del mask_invalid_slots  # -1 top-k slots are always skipped in-kernel
         self.prepare()
         cfg = self.config(run_tokens)
         fn = self._launcher(cfg)
-        # Dynamic MX quant of the activations (same per-1x32 MX path as MegaMoEV2); the
-        # scales are natural [m, H/32], which dispatch copies verbatim into pscale.  SBX:
-        # sbx_send quantizes the bf16 rows itself (one launch less).
-        if sbx_on(cfg.small):
-            x_q, xs = x_bf16.contiguous(), None
-        elif run_tokens:
-            x_q, xs = per_1x32_mx_quant(
-                x_bf16.contiguous(), quant_mode="fp8" if self.a8 else "fp4"
-            )
-        else:  # HIP rejects the quant's zero grid; the rank still launches (peers wait on it)
-            x_q = torch.empty(
-                (0, self.H if self.a8 else self.H // 2),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            xs = torch.empty((0, self.H // 32), dtype=torch.uint8, device=self.device)
         if stream is None:
             stream = torch.cuda.current_stream()
+        # Dynamic MX quant of the activations (same per-1x32 MX path as MegaMoEV2); the
+        # scales are natural [m, H/32], which dispatch copies verbatim into pscale.  SBX:
+        # sbx_send quantizes the bf16 rows itself (one launch less).  On the kernel stream,
+        # so the launch is ordered after it.
+        with torch.cuda.stream(stream):
+            if sbx_on(cfg.small):
+                x_q, xs = x_bf16, None
+            elif run_tokens:
+                x_q, xs = per_1x32_mx_quant(
+                    x_bf16, quant_mode="fp8" if self.a8 else "fp4"
+                )
+            else:  # HIP rejects the quant's zero grid; the rank still launches (peers wait on it)
+                x_q = torch.empty(
+                    (0, self.H if self.a8 else self.H // 2),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                xs = torch.empty(
+                    (0, self.H // 32), dtype=torch.uint8, device=self.device
+                )
         # combine_final writes every row of [0, run_tokens); only the unsliced tail needs zeros
         with torch.cuda.stream(stream):
             out = torch.empty(

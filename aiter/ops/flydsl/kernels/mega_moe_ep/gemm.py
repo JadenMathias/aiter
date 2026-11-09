@@ -268,7 +268,6 @@ def build_gemm(kc: KernelCtx) -> dict:
     assert MT == M_REPEAT
     a_pack = 1 if a8 else 2  # bytes per element (FP8=1, packed FP4=2 per byte)
     a_row_bytes = H // a_pack  # payload (A) bytes per row
-    scale_cols = H // 32  # E8M0 A-scale groups per row
     inter_row_bytes = I // a_pack  # quantized intermediate bytes per row
     inter_scols = I // 32  # E8M0 inter-scale groups per row
 
@@ -293,8 +292,6 @@ def build_gemm(kc: KernelCtx) -> dict:
     def _irow0(e):
         return i32(0) if INTER_REBASE else e * i32(RG)
 
-    K2 = I // 128  # GEMM2 K steps (MFMA K=128)
-    max_norm = 448.0 if a8 else 6.0
     a_dtype = "fp8" if a8 else "fp4"
     n_per_wave = TILE_N // NW  # GEMM1 output cols per wave of one n-tile
     cs_tile_n = TILE_N // 2  # intermediate cols produced by one n-tile

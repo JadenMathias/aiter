@@ -244,16 +244,6 @@ def build_communication(kc: KernelCtx) -> dict:
             report(a, code)
 
     @flyc.jit
-    def poll_zero(fn, a=None, lane=None, err=0):
-        pend = fn()
-        t0 = now()
-        while (pend != i32(0)) & alive(t0):
-            rocdl.s_sleep(1)
-            pend = fn()
-        if const_expr(err != 0):
-            _report_if(a, (pend != i32(0)) & (lane == i32(0)), err)
-
-    @flyc.jit
     def spin_sys_ge(addr, target, a=None, err=0):
         cur = poll_sys_ge(addr, target)
         if const_expr(a is not None):
@@ -348,19 +338,6 @@ def build_communication(kc: KernelCtx) -> dict:
         )
 
     # --- dispatch send (a2a scatter of this rank's tokens to expert owners) -------
-    @flyc.jit
-    def init_recv(L, tid, a):
-        """Sentinel this rank's received-routing region so the planner masks the
-        (token, route) pairs no sender fills this launch. Runs before dispatch; a
-        cross-rank barrier (roles_entry) orders it before any peer writes recv_le."""
-        n = a["npes"] * a["mtpr"] * i32(TOPK)
-        rle = own_rs(a, "off_recv", n * i32(4))
-        for s_ in range(tid, n, i32(NT)):
-            bst(i32(SENTINEL), rle, i32(s_) * i32(4), 0, 0)
-        # commit the sentinels to HBM before barrier_init signals peers -- otherwise an
-        # in-flight sentinel can land AFTER a peer's post-barrier dispatch write and clobber it.
-        wait_vm(0)
-
     @flyc.jit
     def dispatch_route_all(L, tid, a):
         """Scatter each local (token, route)'s local expert id to its expert-owner rank's

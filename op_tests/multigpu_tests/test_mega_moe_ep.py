@@ -9,10 +9,12 @@ over token counts and routings, ending in a markdown summary table::
 Run with plain ``python3`` it relaunches itself under torchrun on up to 8 GPUs, or
 skips without >= 2 gfx950 GPUs. Exits 1 if any case failed.
 
-Shape: DeepSeek-V4-Pro (hidden 7168, inter 3072, 48 experts per rank, top-6). Each
-case runs one eager forward, then captures it in a CUDA graph and checks the output
-of the third replay; the kernel's error flag must stay 0.  ``--mtpr`` <= 256 selects
-the small-batch kernel, larger values the large one.
+Shape (``--network``, 48 experts per rank): ``v4_pro`` DeepSeek-V4-Pro (hidden 7168,
+inter 3072, top-6, SwiGLU limit 10) or ``kimi_k26`` Kimi-K2.6 (hidden 7168, inter 2048,
+top-8, no SwiGLU limit). Each case runs one eager forward, then captures it in a CUDA
+graph and checks the output of the third replay (the replays run on the current stream
+and two side streams); the kernel's error flag must stay 0.
+``--mtpr`` <= 512 selects the small-batch kernel, larger values the large one.
 
 Routings (``route_ids``):
 
@@ -48,13 +50,18 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 
-H, I, EPR, K, SWIGLU_LIMIT = 7168, 3072, 48, 6, 10.0
+EPR = 48
+# (model_dim, inter_dim, topk, swiglu_limit)
+NETWORKS = {
+    "v4_pro": (7168, 3072, 6, 10.0),
+    "kimi_k26": (7168, 2048, 8, 0.0),
+}
 TOL = {"a8w4": 0.10, "a4w4": 0.25}  # rel_l2 vs the oracle
 SPIKE = (0.8, 0.5, 0.35, 0.26, 0.2, 0.17)
 SUPPORTED_GFX = ("gfx950",)
 
 
-def route_ids(route, tokens, experts, world, rank, seed, device):
+def route_ids(route, tokens, experts, world, rank, seed, device, H, K):
     """``(x, wts, ids)`` of ``tokens`` tokens on this rank for routing ``route``."""
     epr = experts // world
     g = torch.Generator(device=device).manual_seed(777 + rank * 131 + tokens + seed)
@@ -95,7 +102,7 @@ def route_ids(route, tokens, experts, world, rank, seed, device):
     return x, wts.float().contiguous(), ids.int().contiguous()
 
 
-def local_weights(rank, device):
+def local_weights(rank, device, H, I):
     """This rank's local experts: natural MXFP4 ``(w1, w1_scale, w2, w2_scale)``."""
     qz = aiter.get_torch_quant(aiter.QuantType.per_1x32)
     g = torch.Generator(device=device).manual_seed(1234 + rank)
@@ -114,7 +121,17 @@ def local_weights(rank, device):
 
 def check(layer, ws, route, tokens, uneven, rank, world, device):
     nb = max(1, tokens * (world + rank) // (2 * world)) if uneven else tokens
-    x, wts, ids = route_ids(route, nb, EPR * world, world, rank, 0, device)
+    x, wts, ids = route_ids(
+        route,
+        nb,
+        EPR * world,
+        world,
+        rank,
+        0,
+        device,
+        layer.cfg.model_dim,
+        layer.cfg.topk,
+    )
     part = layer.engine._part.local  # zeroed so a missed scatter cannot reuse a result
     part.zero_()
     out = layer(x, wts, ids)
@@ -122,11 +139,16 @@ def check(layer, ws, route, tokens, uneven, rank, world, device):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = layer(x, wts, ids)
-    for _ in range(3):
+    cur = torch.cuda.current_stream()
+    # side streams sit on other HW queues, which rotate the CTA -> XCC map
+    for stream in (cur, torch.cuda.Stream(), torch.cuda.Stream()):
         torch.cuda.synchronize()
         dist.barrier()
         part.zero_()
-        graph.replay()
+        stream.wait_stream(cur)
+        with torch.cuda.stream(stream):
+            graph.replay()
+        cur.wait_stream(stream)
     torch.cuda.synchronize()
     err = layer.poll_errors()
     ref = layer.reference_forward(x, wts, ids, ws).float()
@@ -177,6 +199,9 @@ def main() -> int:
         help="Routings (see above).\n    e.g.: -r uniform spike:0.9",
     )
     parser.add_argument("--uneven", action="store_true", help="Uneven per-rank tokens.")
+    parser.add_argument(
+        "--network", choices=NETWORKS, default="v4_pro", help="Layer shape (see above)."
+    )
     args = parser.parse_args()
 
     from aiter.ops.flydsl.mega_moe_ep import MegaMoeEP, MegaMoeEPConfig
@@ -188,7 +213,8 @@ def main() -> int:
     dist.init_process_group("cpu:gloo,cuda:nccl", device_id=device)
     if rank != 0:
         aiter.logger.setLevel("WARNING")
-    ws = local_weights(rank, device)
+    H, I, K, swiglu_limit = NETWORKS[args.network]
+    ws = local_weights(rank, device, H, I)
 
     rows = []
     for quant, mtpr in itertools.product(args.quant, args.mtpr):
@@ -201,7 +227,7 @@ def main() -> int:
             topk=K,
             max_tok_per_rank=mtpr,
             quant=quant,
-            swiglu_limit=SWIGLU_LIMIT,
+            swiglu_limit=swiglu_limit,
         )
         layer = MegaMoeEP(
             cfg, w1=ws[0], w1_scale=ws[1], w2=ws[2], w2_scale=ws[3], device=device
@@ -211,6 +237,7 @@ def main() -> int:
             if tokens > mtpr:
                 continue
             row = {
+                "network": args.network,
                 "quant": quant,
                 "mtpr": mtpr,
                 "tokens": tokens,

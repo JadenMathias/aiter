@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Fused EP MegaMoE layer perf (DeepSeek-V4-Pro shape, MXFP4 weights) over token
-counts and routings, against the two-stage ``MegaMoEV2`` on the same shape::
+"""Fused EP MegaMoE layer perf (MXFP4 weights; ``--network`` shape as in
+``test_mega_moe_ep``) over token counts and routings, against the two-stage
+``MegaMoEV2`` on the same shape::
 
     torchrun --nproc_per_node=8 op_tests/multigpu_tests/bench_mega_moe_ep.py \\
         --engine ep -q a8w4 --mtpr 8192 -t 1024 2048 4096 8192 -r uniform zipf:1 spike
@@ -32,10 +33,10 @@ import aiter
 from aiter import dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_mega_moe_ep import EPR, SWIGLU_LIMIT, H, I, K, route_ids
+from test_mega_moe_ep import EPR, NETWORKS, route_ids
 
 
-def _weights(rank, device):
+def _weights(rank, device, H, I):
     qz = aiter.get_torch_quant(aiter.QuantType.per_1x32)
     g = torch.Generator(device=device).manual_seed(100 + rank)
     out = []
@@ -48,8 +49,9 @@ def _weights(rank, device):
     return out
 
 
-def build(engine, quant, mtpr, rank, world, device):
-    w1q, w1s, w2q, w2s = _weights(rank, device)
+def build(engine, network, quant, mtpr, rank, world, device):
+    H, I, K, swiglu_limit = NETWORKS[network]
+    w1q, w1s, w2q, w2s = _weights(rank, device, H, I)
     common = {
         "rank": rank,
         "world_size": world,
@@ -59,7 +61,7 @@ def build(engine, quant, mtpr, rank, world, device):
         "topk": K,
         "max_tok_per_rank": mtpr,
         "quant": quant,
-        "swiglu_limit": SWIGLU_LIMIT,
+        "swiglu_limit": swiglu_limit,
     }
     if engine == "ep":
         from aiter.ops.flydsl.mega_moe_ep import MegaMoeEP, MegaMoeEPConfig
@@ -128,6 +130,7 @@ def main() -> int:
         formatter_class=argparse.RawTextHelpFormatter, description=__doc__
     )
     parser.add_argument("--engine", default="ep", choices=["ep", "v2"])
+    parser.add_argument("--network", choices=NETWORKS, default="v4_pro")
     parser.add_argument("-q", "--quant", default="a8w4", choices=["a8w4", "a4w4"])
     parser.add_argument("--mtpr", type=int, default=8192, help="max_tok_per_rank")
     parser.add_argument(
@@ -161,16 +164,20 @@ def main() -> int:
         c10d._register_process_group("default", dist.group.WORLD)
         mori_shmem.shmem_torch_process_group_init("default")
 
-    layer = build(args.engine, args.quant, args.mtpr, rank, world, device)
+    H, _, K, _ = NETWORKS[args.network]
+    layer = build(args.engine, args.network, args.quant, args.mtpr, rank, world, device)
     rows = []
     for route in args.routes:
         for tokens in (t for t in args.tokens if t <= args.mtpr):
-            x, wts, ids = route_ids(route, tokens, EPR * world, world, rank, 0, device)
+            x, wts, ids = route_ids(
+                route, tokens, EPR * world, world, rank, 0, device, H, K
+            )
             bal, hot = balance(ids, world)
             ms = bench(layer, x, wts, ids, args, world, device)
             rows.append(
                 {
                     "engine": args.engine,
+                    "network": args.network,
                     "quant": args.quant,
                     "mtpr": args.mtpr,
                     "route": route,

@@ -35,6 +35,7 @@ from .common import (
     bst,
     g_add_agent,
     g_ld_sys,
+    g_or_agent,
     g_st_sys,
     i32,
     lds_atomic_add,
@@ -70,6 +71,7 @@ from .mega_moe_ep_config import (
     OVG0_MIN,
     QCNT,
     QDONE,
+    XMAP,
     KernelCtx,
 )
 
@@ -92,7 +94,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     """The dispatch-planner device functions of one instance (added to kc)."""
     EPR, TOPK = kc.get("EPR TOPK")
     L_CTL, L_DCH, L_DCNT, L_DYN = kc.get("L_CTL L_DCH L_DCNT L_DYN")
-    L_EOFF, L_RIX, L_WSUM, NBW = kc.get("L_EOFF L_RIX L_WSUM NBW")
+    L_RIX, L_WSUM, NBW = kc.get("L_RIX L_WSUM NBW")
     ECNT2, CE_BITS, L_DIX, NDIXW = kc.get("ECNT2 CE_BITS L_DIX NDIXW")
     const_expr, rch, N_TILES = kc.get("const_expr rch N_TILES")
     HWBAR = kc.get("HWBAR")[0]
@@ -119,8 +121,8 @@ def build_schedule(kc: KernelCtx) -> dict:
     NW, NT = kc.get("NW NT")
     # The plan hand-off (ecnt, rowlist) goes through memory with system-scope accesses
     # and each XCD gathers only its own tile-queue echunks, so neither barrier before the
-    # GEMMs needs the agent-scope L2 writeback / invalidate (needs the check that
-    # bid % N_XCD is the hardware XCC).
+    # GEMMs needs the agent-scope L2 writeback / invalidate (needs every bid % N_XCD
+    # class on one hardware XCC, checked in _dynq_passes_nw8).
     AUX_PL = AUX_SYS
     # Small-batch variant: every CTA counts the whole routing window into LDS itself and
     # each XCD buckets the rows of its own expert-aligned echunk range with an XCD-private
@@ -147,8 +149,6 @@ def build_schedule(kc: KernelCtx) -> dict:
     def _q0(L):
         """First echunk L_DIX covers: 0, or (XHOT) this XCD's range start."""
         return lds_ld_i32(L, L_SEG) if XHOT else i32(0)
-
-    assert L_EOFF is not None and const_expr  # L_EOFF: gather offsets (future)
 
     @flyc.jit
     def cbar(L, tid):
@@ -887,9 +887,11 @@ def build_schedule(kc: KernelCtx) -> dict:
     @flyc.jit
     def _dynq_passes_nw8(L, tid, a, nch, nblk):
         x = i32(gpu.block_id("x")) % i32(N_XCD)
-        if tid == i32(0):  # noqa: SIM102 - dynamic scf.if, kept separate
-            if (_hw_xcc_id() & i32(N_XCD - 1)) != x:
-                report(a, ERR_COMPUTE)
+        if tid == i32(0):
+            g_or_agent(
+                ctrl_at(a, i32(XMAP)),
+                i32(1) << ((_hw_xcc_id() - x) & i32(N_XCD - 1)),
+            )
         if const_expr(not SBXP):
             # the first NSX CTAs of each XCD send the remaining rounds, then join
             ns = fx.min(i32(NSXK * N_XCD), nblk)
@@ -996,9 +998,14 @@ def build_schedule(kc: KernelCtx) -> dict:
         if tid == i32(0):
             if i == TT + cx - i32(1):
                 g_st_sys(qa, i32(0))
+            wait_vm(0)  # this CTA's XMAP bit lands before its QDONE arrival
             # the last CTA out: every expert's routes were counted and waited
             if g_add_agent(ctrl_at(a, i32(QDONE)), i32(1)) == nblk - i32(1):
                 g_st_sys(ctrl_at(a, i32(QDONE)), i32(0))
+                xmap = g_add_agent(ctrl_at(a, i32(XMAP)), i32(0))
+                g_st_sys(ctrl_at(a, i32(XMAP)), i32(0))
+                if (xmap & (xmap - i32(1))) != i32(0):
+                    report(a, ERR_COMPUTE)
                 if const_expr(SBXP):
                     sbx_scrub(a)
                     sbx_done(a)

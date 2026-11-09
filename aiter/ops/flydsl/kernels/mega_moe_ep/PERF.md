@@ -84,3 +84,60 @@ gains above at bs >= 4096 and on rb122 / pre61 are not in them yet).
 | | TTFT mean (s) | 25.8 | 26.6 (+3.2%) |
 | | TPOT mean (ms) | 58.3 | 56.8 (-2.6%) |
 | concurrency 512, decode MoE call (profiler) | us per call | 293.2 (small_m) | 262.6 (-10.4%) |
+
+## Single layer, mtpr 512 (ms)
+
+The small-batch kernel covers mtpr <= 512 (it used to stop at 256, so mtpr 512 ran
+the large kernel). DeepSeek-V4-Pro, uniform routing, EP only (before / after):
+
+| quant | bs1 | bs4 | bs16 | bs64 | bs128 | bs256 | bs384 | bs448 | bs512 |
+|---|---|---|---|---|---|---|---|---|---|
+| a8w4 large kernel | 0.279 | 0.236 | 0.370 | 0.394 | 0.406 | 0.424 | 0.466 | 0.483 | 0.521 |
+| a8w4 SB | 0.080 | 0.159 | 0.271 | 0.294 | 0.318 | 0.360 | 0.412 | 0.453 | 0.517 |
+| a4w4 large kernel | 0.267 | 0.229 | 0.356 | 0.379 | 0.388 | 0.400 | 0.437 | 0.445 | 0.469 |
+| a4w4 SB | 0.092 | 0.157 | 0.268 | 0.293 | 0.308 | 0.335 | 0.373 | 0.409 | 0.467 |
+
+## Kimi-K2.6
+
+hidden 7168, inter 2048, 384 experts (48 per rank), top-8, SiLU without a SwiGLU
+clamp, a8w4. Same method as above (`--network kimi_k26`), measured on aiter main with
+flydsl 0.4.2 against `MegaMoEV2` small_m / large_m tuned for this shape ("V0") and
+large_m with the PR's dispatch options (`AITER_LM_BATCH_COPY=1 AITER_LM_ONE_FENCE=1
+AITER_LM_DEDUP=1 AITER_LM_HELPER_CU=8 AITER_LM_HELPER_FEEDBACK=0`, "DD_H8"). With
+flydsl 0.4.1 the large kernel is 4-6% slower on this shape (more VGPR spills).
+
+mtpr 8192, large_m vs EP:
+
+| route | bs | V0 | DD_H8 | EP |
+|---|---|---|---|---|
+| uniform | 1024 | 0.906 | 0.787 | 0.636 (-19% vs DD_H8) |
+| uniform | 2048 | 1.422 | 1.201 | 1.052 (-12%) |
+| uniform | 4096 | 2.543 | 2.220 | 1.972 (-11%) |
+| uniform | 8192 | 4.633 | 4.043 | 3.836 (-5%) |
+| zipf:1 | 1024 | 1.560 | 1.656 | 1.300 (-17% vs V0) |
+| zipf:1 | 4096 | 5.380 | 5.965 | 4.791 (-11%) |
+| zipf:1 | 8192 | 10.629 | 11.991 | 9.620 (-9%) |
+
+mtpr 512, uniform, small_m vs EP (SB kernel):
+
+| bs | 1 | 4 | 16 | 64 | 128 | 256 | 384 | 448 | 512 |
+|---|---|---|---|---|---|---|---|---|---|
+| small_m | 0.078 | 0.151 | 0.215 | 0.226 | 0.256 | 0.326 | 0.464 | 0.539 | 0.568 |
+| EP | 0.083 | 0.143 | 0.198 | 0.214 | 0.241 | 0.275 | 0.382 | 0.437 | 0.452 |
+
+Full model: sglang v0.5.23 serving Kimi-K2.6-MXFP4, DP8 attention + EP8, no EPLB,
+prompts 8192 in / 1024 out, CUDA graph decode (capacity 512 per rank), prefill
+chunks of 8192 tokens per rank; only the MoE layer differs. GSM8K (5-shot, 1319
+questions): small_m + large_m 0.938, + DD_H8 0.940, EP 0.946.
+
+| run | metric | small_m + large_m DD_H8 | EP |
+|---|---|---|---|
+| concurrency 512, 2048 prompts | output throughput (tok/s) | 7,371 | 7,875 (+6.8%) |
+| | TPOT mean (ms) | 49.8 | 46.6 (-6.4%) |
+| concurrency 4096, 8192 prompts, per step | decode tok/s per rank (~350 running) | 4,722 | 5,168 (+9.4%) |
+| | prefill tok/s per rank (8192-token chunks) | 13,375 | 14,684 (+9.8%) |
+
+At concurrency 4096 the end-to-end throughput depends on which of a few scheduling
+trajectories a run falls into (up to 13% apart for the same server), so the table
+gives the per-step rates from the server log; within one trajectory EP's output
+throughput is 3.4-8.9% above DD_H8.
