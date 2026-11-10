@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import fnmatch
 import functools
 import importlib
 import json
@@ -1398,6 +1399,24 @@ def _cluster_launch_target(detect_gfx) -> bool:
     return _targets_gfx1250(detect_gfx)
 
 
+def module_skip_archs(md_name: str) -> set[str]:
+    """Archs left out of md_name's build, per AITER_MODULE_SKIP_ARCHS.
+
+    Format: "<arch>:<glob>[,<glob>...][;<arch>:<glob>...]", e.g.
+    "gfx1250:module_topk_plain,module_moe_opus". For kernels that do not support an
+    arch in a multi-arch GPU_ARCHS build: the module is built for the other archs and
+    has no code object for the skipped one.
+    """
+    skip = set()
+    for entry in os.getenv("AITER_MODULE_SKIP_ARCHS", "").split(";"):
+        arch, _, globs = entry.partition(":")
+        if arch.strip() and any(
+            fnmatch.fnmatchcase(md_name, g.strip()) for g in globs.split(",") if g.strip()
+        ):
+            skip.add(arch.strip())
+    return skip
+
+
 def build_module(
     md_name,
     srcs,
@@ -1415,6 +1434,10 @@ def build_module(
     flags_extra_hip_per_source=None,
     build_after_wait=False,
 ):
+    skip_archs = module_skip_archs(md_name)
+    if skip_archs and not [a for a in validate_and_update_archs() if a not in skip_archs]:
+        logger.info(f"skip build [{md_name}]: AITER_MODULE_SKIP_ARCHS leaves no target arch")
+        return
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
@@ -1562,7 +1585,9 @@ def build_module(
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
-        archs = validate_and_update_archs()
+        archs = [a for a in validate_and_update_archs() if a not in skip_archs]
+        if skip_archs:
+            logger.info(f"build [{md_name}] without {sorted(skip_archs)} (AITER_MODULE_SKIP_ARCHS)")
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
