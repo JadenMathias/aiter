@@ -245,7 +245,13 @@ template torch::Tensor
                 name=name, dtypes=f"{a_type}, {b_type}, {acc_type}, {c_type}"
             )
             if "fp4" in b_type:
-                body = "#ifndef __gfx942__\n" + body + "\n#endif\n"
+                # The MXFP4 flatmm pipeline is gfx950-only: keep the host pass and the
+                # gfx950 device pass, drop every other device pass (gfx942, gfx12).
+                body = (
+                    "#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__)\n"
+                    + body
+                    + "\n#endif\n"
+                )
             Path(
                 os.path.join(
                     self.instances_path,
